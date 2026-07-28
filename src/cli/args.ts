@@ -60,6 +60,8 @@ export type ReviewArgs = {
   validation: string[];
   config?: string;
   allowRepoConfig: boolean;
+  /** Trust the repository's own git config, including keys git executes. */
+  allowRepoExecConfig: boolean;
   maxOutputBytes?: number;
   timeoutMs?: number;
   exitZero: boolean;
@@ -94,6 +96,7 @@ const VALUE_FLAGS = [
 /** Options that are present or absent and never take a value. */
 const BOOLEAN_FLAGS = [
   "--allow-repo-config",
+  "--allow-repo-exec-config",
   "--exit-zero",
   "--debug",
   "--help",
@@ -217,6 +220,7 @@ type Accumulator = {
   validation: string[];
   config: string | undefined;
   allowRepoConfig: boolean;
+  allowRepoExecConfig: boolean;
   maxOutputBytes: number | undefined;
   timeoutMs: number | undefined;
   exitZero: boolean;
@@ -245,6 +249,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     validation: [],
     config: undefined,
     allowRepoConfig: false,
+    allowRepoExecConfig: false,
     maxOutputBytes: undefined,
     timeoutMs: undefined,
     exitZero: false,
@@ -293,6 +298,9 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       switch (name) {
         case "--allow-repo-config":
           state.allowRepoConfig = true;
+          break;
+        case "--allow-repo-exec-config":
+          state.allowRepoExecConfig = true;
           break;
         case "--exit-zero":
           state.exitZero = true;
@@ -452,6 +460,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     validate: state.validate,
     validation: state.validation,
     allowRepoConfig: state.allowRepoConfig,
+    allowRepoExecConfig: state.allowRepoExecConfig,
     exitZero: state.exitZero,
     debug: state.debug,
   };

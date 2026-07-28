@@ -209,6 +209,7 @@ async function main(argv: readonly string[]): Promise<void> {
     validations: plan.planned,
     denied: plan.denied,
     limits,
+    ...(args.allowRepoExecConfig ? { allowRepoExecConfig: true } : {}),
   };
 
   const result: ReviewResult = await reviewRepository(request);

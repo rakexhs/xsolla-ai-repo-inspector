@@ -533,3 +533,103 @@ describe("MCP error message hygiene", () => {
     expect(head).toMatch(/^E_[A-Z_]+: /);
   });
 });
+
+/**
+ * The `readOnlyHint: true` annotation on `inspect_repository` is not decoration:
+ * MCP clients use it to decide what to auto-approve without asking a human. So
+ * "read-only" has to mean "executes nothing", not merely "writes no index file".
+ *
+ * The first version of this tool advertised that annotation while a repository's
+ * own `.git/config` could name a command git would run during inspection. There
+ * is no MCP input that disables the hardening — `allowRepoExecConfig` is absent
+ * from both tool schemas by construction — and that absence is what this suite
+ * pins down.
+ */
+describe("MCP inspection executes nothing from repository config", () => {
+  let repo: RepoHandle;
+  let probeDir: string;
+  let marker: string;
+  let session: Session;
+
+  beforeEach(async () => {
+    repo = await makeRepo("agent workspace");
+    await repo.write("tracked.txt", "original\n");
+    await repo.commit("init");
+    await repo.write("tracked.txt", "modified\n");
+
+    // Space-free: git treats a config value as a command *line* and would split
+    // a spaced path, so a probe under the work tree would never run and this
+    // whole suite would pass for the wrong reason.
+    probeDir = await fs.realpath(
+      await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "mcp-probe-")),
+    );
+    marker = path.join(probeDir, "EXECUTED.marker");
+    const probe = path.join(probeDir, "fsmonitor.sh");
+    await fs.writeFile(
+      probe,
+      `#!/bin/sh\nprintf executed > '${marker}'\nexit 1\n`,
+      "utf8",
+    );
+    await fs.chmod(probe, 0o755);
+    await repo.run("config", "core.fsmonitor", probe);
+
+    session = await connect(repo.root, DEFAULT_CONFIG);
+  });
+
+  afterEach(async () => {
+    await session.close();
+    await repo.cleanup();
+    await fs.rm(probeDir, { recursive: true, force: true });
+  });
+
+  async function markerExists(): Promise<boolean> {
+    return fs
+      .access(marker)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  it("armed: raw git in the same repository does run the probe", async () => {
+    // Negative control. Without this, the assertion below could pass because the
+    // fixture was broken rather than because the defence works.
+    await repo.run("status", "--porcelain").catch(() => "");
+    expect(await markerExists()).toBe(true);
+  });
+
+  it("does not execute core.fsmonitor during an MCP inspection", async () => {
+    const outcome = narrow(
+      await session.client.callTool({
+        name: TOOL_INSPECT,
+        arguments: { repo_path: repo.dir },
+      }),
+    );
+
+    expect(outcome.isError).toBe(false);
+    expect(await markerExists()).toBe(false);
+  });
+
+  it("offers no input that could re-enable repository config execution", async () => {
+    const { tools } = await session.client.listTools();
+    // Checked against the advertised schema rather than the source, because the
+    // schema is what an agent can actually reach.
+    for (const tool of tools) {
+      const keys = Object.keys(
+        (tool.inputSchema as { properties?: Record<string, unknown> }).properties ??
+          {},
+      );
+      expect(keys).not.toContain("allow_repo_exec_config");
+      expect(keys).not.toContain("allowRepoExecConfig");
+    }
+  });
+
+  it("still reports the repository's changes correctly while hardened", async () => {
+    const outcome = narrow(
+      await session.client.callTool({
+        name: TOOL_INSPECT,
+        arguments: { repo_path: repo.dir, detail: "full" },
+      }),
+    );
+    const result: ReviewResult = ReviewResultSchema.parse(outcome.structured);
+    expect(result.changes.files.map((f) => f.path)).toContain("tracked.txt");
+  });
+});

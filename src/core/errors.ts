@@ -20,6 +20,12 @@ export const FATAL_CODES = [
   "E_PATH_OUTSIDE_ROOT",
   "E_CONFIG_INVALID",
   "E_VALIDATION_UNKNOWN",
+  /**
+   * The repository configures a command git would execute, and the key cannot be
+   * safely disabled. Fatal rather than a warning: continuing would execute
+   * repository-chosen code while the MCP surface advertises `readOnlyHint`.
+   */
+  "E_REPO_EXEC_CONFIG",
   "E_INTERNAL",
 ] as const;
 
@@ -36,6 +42,8 @@ export const NON_FATAL_CODES = [
   "W_SUBMODULE_UNINSPECTED",
   "W_TRUNCATED",
   "W_REPO_CONFIG_IGNORED",
+  "W_REPO_EXEC_CONFIG_NEUTRALISED",
+  "W_REPO_EXEC_CONFIG_TRUSTED",
 ] as const;
 
 export const DIAGNOSTIC_CODES = [...FATAL_CODES, ...NON_FATAL_CODES] as const;
@@ -97,6 +105,7 @@ export function exitCodeForDiagnostic(code: DiagnosticCode): ExitCode {
     case "E_NO_MERGE_BASE":
     case "E_GIT_FAILED":
     case "E_PATH_OUTSIDE_ROOT":
+    case "E_REPO_EXEC_CONFIG":
       return EXIT_CODES.INSPECTION_FAILED;
     case "E_INTERNAL":
       return EXIT_CODES.INTERNAL;

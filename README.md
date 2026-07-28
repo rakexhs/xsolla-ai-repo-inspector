@@ -10,10 +10,12 @@ unstaged, untracked), optionally runs validation commands, and returns the
 result as Markdown or as a structured JSON document. It is used by developers
 from a command line, and by AI coding agents over MCP.
 
-The supported behavior is exercised by automated tests: typecheck, build, and
-411 tests covering unit parsers, real Git fixtures, validation containment,
-CLI subprocesses, in-memory MCP, CLI/MCP parity, packaging, and adversarial
-inputs. Deliberate boundaries are listed under Limitations below.
+The supported behavior is exercised by automated tests: typecheck, build, and a
+suite covering unit parsers, real Git fixtures, validation containment, CLI
+subprocesses, in-memory MCP, CLI/MCP parity, packaging, documentation accuracy,
+and adversarial inputs. Run `npm test` for the current count — this file does not
+quote one, because a number that has to be hand-updated to stay true is a defect
+with a delay on it. Deliberate boundaries are listed under Limitations below.
 
 ---
 
@@ -117,6 +119,7 @@ After `npm run build`, the binary is available as `inspector`.
 | `--validation <name>` | Named validation from the config, repeatable. |
 | `--config <path>` | Operator config file. |
 | `--allow-repo-config` | Permit loading `<repo>/inspector.config.json`. |
+| `--allow-repo-exec-config` | Trust repository-scoped git config keys that git *executes*, such as `filter.*.clean`. Off by default; see Trust boundary. |
 | `--max-output-bytes <n>` | Per-stream output cap. |
 | `--timeout <ms>` | Per-validation timeout. |
 | `--exit-zero` | Exit 0 whenever a report was produced. |
@@ -144,19 +147,26 @@ different situation from "I could not read the repository".
 
 ## Configuration
 
-A JSON file, owned by whoever **runs** the tool:
+A JSON file, owned by whoever **runs** the tool. A working example is committed
+as [`inspector.config.json`](./inspector.config.json) — the one the CLI examples
+above pass to `--config`:
 
 ```json
 {
   "validations": {
-    "test": { "argv": ["npm", "test"], "timeoutMs": 120000, "description": "Unit tests" },
-    "lint": { "argv": ["npm", "run", "lint"] }
+    "test": { "argv": ["npm", "test"], "timeoutMs": 300000, "description": "Full vitest suite" },
+    "typecheck": { "argv": ["npm", "run", "typecheck"], "timeoutMs": 120000 }
   },
   "mcp": {
-    "allowValidations": ["test", "lint"]
+    "allowValidations": ["typecheck"]
   }
 }
 ```
+
+Every validation in the committed example resolves to a script `package.json`
+actually defines, and a test asserts it
+(`test/docs/consistency.test.ts`) — because "the config references a script that
+does not exist" is precisely the kind of defect this tool exists to catch.
 
 - `argv` is an **array, never a string** — there is no shell anywhere in this
   tool.
@@ -195,8 +205,12 @@ After building, the binary is `inspector-mcp`. Launch options:
 | `detail` | `summary` \| `full`, optional |
 
 Annotations: `readOnlyHint: true`, `destructiveHint: false`,
-`idempotentHint: true`, `openWorldHint: false`. The read-only claim is tested,
-not merely asserted: a test confirms `.git/index` is not modified by a call.
+`idempotentHint: true`, `openWorldHint: false`. The read-only claim is tested in
+both of its senses, because the narrow one is not sufficient: a test confirms
+`.git/index` is not modified by a call, **and** a separate suite confirms a call
+executes nothing named by the inspected repository's own git config
+(`test/mcp/security.test.ts`). The first version of this tool passed the former
+while failing the latter — see Trust boundary.
 
 **`run_validations`** — the same inputs plus `validations`, an array of
 allowlisted **names**. There is no field through which a command string could be
@@ -283,7 +297,53 @@ agent would execute it merely by asking for "test" — the same confused-deputy
 bug wearing a disguise. Repo-local config is therefore ignored unless
 `--allow-repo-config` is passed, and never on the MCP surface at all. When one
 is present but ignored, that is reported as a warning rather than passing
-silently.
+silently. (This repository commits an `inspector.config.json`, so inspecting it
+without `--config` demonstrates exactly that warning.)
+
+**The repository does not get to choose a command through `git`, either.** This
+is the subtlest boundary here, and the one the first version of this tool got
+wrong. `git` executes commands named by its own configuration, and configuration
+is repository content: `.git/config` arrives with the directory you were handed,
+whether that is an unpacked archive, a CI artifact, a mounted workspace, or a
+vendored tree. Three vectors were reproduced against the previous version, none
+of them involving a shell:
+
+| Repository-controlled key | Runs during | Notes |
+|---|---|---|
+| `core.fsmonitor` | `git status` | a plain path to a script |
+| `filter.<name>.clean` | `git diff` | selected by an in-tree `.gitattributes`, which is *tracked* content and survives `git clone` |
+| either, behind `include.path` | both | invisible to `git config --list --local` |
+
+The validation allowlist did not help, because nothing passed through it: `git`
+was the process doing the executing. And since `inspect_repository` advertises
+`readOnlyHint: true`, which clients use to auto-approve without asking a human,
+"read-only" has to mean *executes nothing*, not merely *writes no index*. The
+defence has three layers:
+
+- **Two keys are pinned unconditionally.** `core.fsmonitor` and `diff.external`
+  are blanked with `-c key=` on every invocation. `-c` outranks every config
+  file, including a value pulled in indirectly through `include.path`. Both have
+  fixed names, so they need no prior read of the repository and therefore carry
+  no time-of-check/time-of-use gap — and neither costs anything this tool needs
+  (`fsmonitor` is a performance hint; `diff.external` only produces diff bodies,
+  which are never reported).
+- **Attacker-named drivers are discovered, then blanked.** `filter.<n>.clean`
+  and `diff.<n>.textconv` have no fixed key to block, so the effective config is
+  enumerated with `git config --list -z --show-scope`, which resolves
+  `include.path` *and* attributes each resulting key to the scope of the file
+  that pulled it in. Reading configuration executes none of it. Only `local` and
+  `worktree` scope are touched: `git-lfs` legitimately sets `filter.lfs.clean`
+  **globally**, and blanking the operator's own config would corrupt reported
+  paths for every LFS repository while buying nothing.
+- **`git diff` refuses the behaviour outright** via `--no-ext-diff` and
+  `--no-textconv`, so this layer does not depend on the audit having seen a key.
+
+A key that cannot be safely written back as `-c <key>=` — a driver whose
+subsection contains a space, for instance — is **fatal**
+(`E_REPO_EXEC_CONFIG`, exit 3) rather than skipped, because skipping it would
+leave it live while reporting success. `--allow-repo-exec-config` opts back in to
+the discovered drivers and warns that it did; the two pinned keys stay pinned
+either way.
 
 **Refs are validated before they reach `git`.** An argv array stops *shell*
 injection but not *argument* injection: `--base-ref "--output=/tmp/x"` would
@@ -325,6 +385,8 @@ npm run verify        # typecheck + build + test
 | `test/mcp/` | in-process client/server contract and security, over `InMemoryTransport` |
 | `test/consistency/` | CLI JSON deep-equals MCP `structuredContent`; default divergences pinned |
 | `test/adversarial/` | hostile inputs, unusual repository states, resource exhaustion |
+| `test/adversarial/git-config-exec.test.ts` | repository-controlled executable git config: each vector has an **armed** case proving the probe really runs and a **disarmed** case proving inspection does not run it |
+| `test/docs/consistency.test.ts` | the README documents every parser flag, the committed config names only real npm scripts, referenced test paths exist |
 | `test/packaging/` | `npm pack`, install the tarball into a clean project, run the installed binary |
 
 The packaging suite exists because the previous version of this project built
@@ -343,6 +405,18 @@ rejected rather than interpreted; validations run one at a time; rename
 detection follows Git’s defaults; non-UTF-8 bytes are lossy under UTF-8 decoding.
 
 - **The validation allowlist is a mitigation, not a sandbox** (see above).
+- **Repository git config is disarmed, not sandboxed.** Discovered executable
+  keys are blanked for the duration of the inspection, which closes the vectors
+  above, but the audit is a read followed by a use: a repository whose
+  `.git/config` is rewritten *between* those two steps by a concurrent writer
+  could still land a driver. The two keys with fixed names are pinned
+  unconditionally precisely because they need no read; the enumerated driver
+  families cannot be. Inspecting a tree that another process is actively
+  modifying is outside what this tool claims.
+- **Disarming can change what is reported.** A repository that legitimately
+  configures a `clean` filter locally will have it disabled, and git may then
+  report a filtered file as modified. The warning names every key it blanked, and
+  `--allow-repo-exec-config` restores them.
 - **Windows is not supported.** Process-group termination uses POSIX semantics.
 - **Submodules are not descended into**; their presence is reported as a warning.
 - **Diff content is never reported** — names and statuses only, deliberately.
@@ -361,7 +435,8 @@ detection follows Git’s defaults; non-UTF-8 bytes are lossy under UTF-8 decodi
 ```text
 src/core/       result contract (zod), diagnostics, exit codes, text budgeting,
                 and the review engine — the only place a review is produced
-src/git/        hardened git invocation, -z parsers, four-scope inspection
+src/git/        hardened git invocation, repository-config audit, -z parsers,
+                four-scope inspection
 src/validation/ tokenizer, operator config + trust decisions, hardened runner
 src/render/     Markdown and JSON renderers; json.ts is the only serialisation
                 path, which is what keeps the two interfaces identical

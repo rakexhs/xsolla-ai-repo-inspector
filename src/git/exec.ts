@@ -5,9 +5,16 @@
  *
  *  1. **No shell, ever.** `execFile` receives an argv array, so a branch name,
  *     a ref, or a path containing spaces, quotes, `;` or `$(...)` is passed
- *     through as one opaque argument. The starter interpolated paths into a
- *     shell string, which both corrupted paths containing spaces and opened a
- *     command-injection hole.
+ *     through as one opaque argument.
+ *
+ *     Precision about the starter matters here, because three different defects
+ *     are easy to blur into one: the starter's `src/git.ts` already used
+ *     `execFileSync` with an argv array and was *not* a shell-injection hole.
+ *     The shell was in `src/validation.ts`, which called `exec(command)` and so
+ *     ran every validation through `/bin/sh`. Path corruption was separate again
+ *     and came from `src/cli.ts`, which parsed `--repo` as
+ *     `argv[++index]?.split(" ")[0]` and silently truncated any path at its
+ *     first space. What `git.ts` actually lacked was defence (2).
  *
  *  2. **No *argument* injection either.** An argv array stops shell injection
  *     and nothing else. A caller-supplied ref is still parsed by Git's own
@@ -24,7 +31,21 @@
  *     inserts `--end-of-options` ahead of them; and {@link runGit} refuses to
  *     spawn at all if anything after that sentinel could be read as an option.
  *
- *  3. **Failure is a value, not an exception.** Git exiting non-zero is a
+ *  3. **No *configuration* injection either.** This is the subtlest of the
+ *     three and the one the first version of this tool got wrong. `git` executes
+ *     commands named by its own configuration, and a repository carries
+ *     configuration: `.git/config` is part of the tree you were handed, not part
+ *     of the environment you control. `core.fsmonitor` runs during
+ *     `git status`; a `filter.<name>.clean` driver selected by an in-tree
+ *     `.gitattributes` runs during `git diff`. Both were reproduced executing
+ *     arbitrary code while this tool advertised `readOnlyHint: true` — which MCP
+ *     clients use to decide what to auto-approve without asking a human.
+ *
+ *     `--no-optional-locks` is not a defence here, and neither is the absence of
+ *     a shell: git is the one doing the executing. See
+ *     {@link BASELINE_NEUTRALISED_KEYS} and `./config-audit.ts`.
+ *
+ *  4. **Failure is a value, not an exception.** Git exiting non-zero is a
  *     completely ordinary event (`rev-parse --verify -q` on a ref that does not
  *     exist is how you *test* for a ref). Callers get a discriminated union and
  *     decide what is fatal.
@@ -46,6 +67,47 @@ const MAX_STDERR_CHARS = 300;
  * "option must come before non-option arguments" and writes nothing.
  */
 export const END_OF_OPTIONS = "--end-of-options";
+
+/**
+ * Config keys blanked on *every* invocation, whatever scope set them.
+ *
+ * Both name a command git will execute, both are reachable from the read-only
+ * subcommands this tool runs, and both have a fixed key name — so they can be
+ * pinned without first reading the repository's configuration. That matters:
+ * anything discovered by reading config first (see `./config-audit.ts`) has an
+ * unavoidable time-of-check/time-of-use gap, and these two are the vectors most
+ * worth closing unconditionally.
+ *
+ * The cost is honest and small: `core.fsmonitor` is a performance optimisation
+ * we forgo, and `diff.external` only produces diff *bodies*, which this tool
+ * never reports anyway.
+ */
+export const BASELINE_NEUTRALISED_KEYS = [
+  "core.fsmonitor",
+  "diff.external",
+] as const;
+
+/**
+ * `-c key=` for each key, which overrides every config file: `-c` sits at the
+ * top of git's precedence order, so it beats a value pulled in indirectly via
+ * `include.path` (verified — an included `core.fsmonitor` still loses).
+ */
+export function configOverrideArgs(keys: readonly string[]): string[] {
+  return keys.flatMap((key) => ["-c", `${key}=`]);
+}
+
+/**
+ * A config key safe to interpolate into `-c <key>=`.
+ *
+ * The audit feeds keys back from git's own output into a later argv, so this is
+ * the point where that loop is closed: a key is section(.subsection).name, and
+ * anything else — a leading dash, an `=`, whitespace, a control character — is
+ * dropped rather than passed through. Without this, the defence could itself
+ * become the injection vector it exists to prevent.
+ */
+export function isSafeConfigKey(key: string): boolean {
+  return /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(key) && key.length <= 200;
+}
 
 export type GitResult =
   | { ok: true; stdout: string }
@@ -167,15 +229,36 @@ export function runGit(
   repositoryPath: string,
   args: readonly string[],
   timeoutMs: number,
+  /**
+   * Extra config keys to blank, discovered by auditing the repository. Always
+   * applied *in addition* to {@link BASELINE_NEUTRALISED_KEYS}.
+   */
+  neutraliseKeys: readonly string[] = [],
 ): Promise<GitResult> {
   const violation = checkOperands(args);
   if (violation !== null) return Promise.resolve(refuse(violation));
 
+  const unsafeKey = neutraliseKeys.find((key) => !isSafeConfigKey(key));
+  if (unsafeKey !== undefined) {
+    // Fail closed. Passing it through would be an injection; silently skipping
+    // it would leave an executable config key live while reporting success.
+    return Promise.resolve(
+      refuse(
+        `refusing unsafe git config key: ${JSON.stringify(unsafeKey).slice(0, 120)}`,
+      ),
+    );
+  }
+
   // `--no-optional-locks` is a top-level flag and must precede the subcommand.
   // Applied here, once, so every command in the codebase is read-only: the MCP
   // tool advertises `readOnlyHint: true` and that annotation has to be
-  // literally true, not approximately true.
-  const argv = ["--no-optional-locks", ...args];
+  // literally true, not approximately true. The `-c` overrides are what make
+  // "read-only" mean "executes nothing", not merely "writes no index".
+  const argv = [
+    "--no-optional-locks",
+    ...configOverrideArgs([...BASELINE_NEUTRALISED_KEYS, ...neutraliseKeys]),
+    ...args,
+  ];
 
   return new Promise<GitResult>((resolve) => {
     execFile(
@@ -248,8 +331,9 @@ export function runGitRefs(
   refs: readonly string[],
   timeoutMs: number,
   options: RefCommandOptions = {},
+  neutraliseKeys: readonly string[] = [],
 ): Promise<GitResult> {
   const argv = [...flags, END_OF_OPTIONS, ...refs];
   if (options.pathspecTerminator === true) argv.push("--");
-  return runGit(repositoryPath, argv, timeoutMs);
+  return runGit(repositoryPath, argv, timeoutMs, neutraliseKeys);
 }

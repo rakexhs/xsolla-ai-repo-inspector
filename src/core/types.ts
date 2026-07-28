@@ -315,4 +315,14 @@ export type ReviewRequest = {
   validations: PlannedValidation[];
   denied: DeniedValidation[];
   limits: Limits;
+  /**
+   * Trust the inspected repository's own git configuration, including keys git
+   * executes. Absent or false means repository-scoped executable keys are
+   * disabled for the duration of the inspection.
+   *
+   * Like every other field here, this is a decision already taken by an
+   * adapter: the CLI can set it from `--allow-repo-exec-config`, and the MCP
+   * adapter has no path to set it at all.
+   */
+  allowRepoExecConfig?: boolean;
 };

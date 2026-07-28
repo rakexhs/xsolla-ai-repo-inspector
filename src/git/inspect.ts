@@ -38,6 +38,7 @@ import type {
 import { SCOPES, STATUS_PRECEDENCE } from "../core/types.js";
 import type { GitResult } from "./exec.js";
 import { isSafeGitOperand, runGit, runGitRefs } from "./exec.js";
+import { auditRepositoryConfig } from "./config-audit.js";
 import { parseNameStatusZ, parsePorcelainZ } from "./parse.js";
 
 export type InspectOptions = {
@@ -49,6 +50,20 @@ export type InspectOptions = {
   scopes: Scope[];
   maxFilesPerScope: number;
   timeoutMs: number;
+  /**
+   * Skip the repository config audit, leaving repository-scoped executable keys
+   * such as `filter.<n>.clean` live. Default false.
+   *
+   * `BASELINE_NEUTRALISED_KEYS` is unaffected: no value of this flag re-enables
+   * `core.fsmonitor` or `diff.external`, because blanking those costs nothing
+   * this tool needs and they are the two vectors with a time-of-check gap.
+   *
+   * Opting in is equivalent to trusting the repository, exactly like
+   * `--allow-repo-config`. The MCP adapter never sets it: an agent's arguments
+   * are influenced by repository text, so the repository must not be able to
+   * talk its way into being trusted.
+   */
+  allowRepoExecConfig?: boolean;
 };
 
 export type InspectOutcome = {
@@ -202,13 +217,82 @@ export async function inspectRepository(
   }
 }
 
+/**
+ * Decides which repository-controlled config keys to blank for this inspection.
+ *
+ * Fails closed in both directions that matter: if the audit cannot run, the
+ * inspection stops rather than proceeding with unknown configuration; if a
+ * discovered key cannot be safely written as `-c <key>=`, the same. The only way
+ * to run with these keys live is to ask for it explicitly on the CLI.
+ */
+async function resolveNeutralisedConfigKeys(
+  options: InspectOptions,
+  diagnostics: Diagnostic[],
+): Promise<string[]> {
+  if (options.allowRepoExecConfig === true) {
+    diagnostics.push(
+      diagnostic(
+        "W_REPO_EXEC_CONFIG_TRUSTED",
+        "warning",
+        "Trusting the repository's own git configuration (--allow-repo-exec-config); repository-scoped keys such as filter.*.clean may execute during inspection. core.fsmonitor and diff.external stay disabled regardless of this flag.",
+        "Drop the flag to inspect an untrusted repository without executing any of its configuration.",
+      ),
+    );
+    return [];
+  }
+
+  const audit = await auditRepositoryConfig(
+    options.repositoryPath,
+    options.timeoutMs,
+  );
+
+  if (!audit.ok) {
+    const error = audit.error;
+    if (error !== undefined) throw gitFailure(error, "reading git configuration");
+    throw fatal("E_GIT_FAILED", "Could not read the repository's git configuration.");
+  }
+
+  if (audit.unsafe.length > 0) {
+    throw fatal(
+      "E_REPO_EXEC_CONFIG",
+      `Repository config sets ${audit.unsafe.length} executable key(s) that cannot be safely disabled: ${audit.unsafe.join(", ")}.`,
+      "Remove the key from .git/config, or pass --allow-repo-exec-config if you trust this repository.",
+    );
+  }
+
+  if (audit.neutralise.length > 0) {
+    diagnostics.push(
+      diagnostic(
+        "W_REPO_EXEC_CONFIG_NEUTRALISED",
+        "warning",
+        `Disabled ${audit.neutralise.length} executable git config key(s) owned by this repository: ${audit.neutralise.join(", ")}.`,
+        "These would otherwise run commands during inspection. If they are legitimate (git-lfs configured repository-locally, for example), pass --allow-repo-exec-config; reported paths may differ while they are disabled.",
+      ),
+    );
+  }
+
+  return audit.neutralise;
+}
+
 async function inspect(options: InspectOptions): Promise<InspectOutcome> {
   const { repositoryPath, timeoutMs } = options;
   const diagnostics: Diagnostic[] = [];
 
+  /**
+   * Repository-scoped config keys git would execute, blanked on every command
+   * issued below. Populated at step 2a, once we know this is a work tree.
+   *
+   * Deliberately mutable and captured by the closures rather than resolved
+   * first: the audit spawns git itself, so running it before the work-tree check
+   * would report `E_GIT_FAILED` for a path that simply does not exist, when the
+   * caller needs to hear `E_NOT_A_REPO`. Diagnosis precision and this defence
+   * are both requirements, so the ordering has to satisfy both.
+   */
+  let neutralise: string[] = [];
+
   // Flag-only commands: no operand can appear, so nothing untrusted is passed.
   const git = (args: readonly string[]): Promise<GitResult> =>
-    runGit(repositoryPath, args, timeoutMs);
+    runGit(repositoryPath, args, timeoutMs, neutralise);
 
   // Commands that take ref operands. `flags` is always literal text authored
   // here; `refs` is the untrusted half and is placed after `--end-of-options`.
@@ -217,7 +301,14 @@ async function inspect(options: InspectOptions): Promise<InspectOutcome> {
     refs: readonly string[],
     pathspecTerminator = false,
   ): Promise<GitResult> =>
-    runGitRefs(repositoryPath, flags, refs, timeoutMs, { pathspecTerminator });
+    runGitRefs(
+      repositoryPath,
+      flags,
+      refs,
+      timeoutMs,
+      { pathspecTerminator },
+      neutralise,
+    );
 
   // --- 0. Reject a hostile base ref before it reaches any command ----------
   // An argv array prevents *shell* injection but not *argument* injection: git
@@ -262,6 +353,20 @@ async function inspect(options: InspectOptions): Promise<InspectOutcome> {
   // trailing spaces or tabs from the repository name, producing a nonexistent
   // cwd for validations.
   const rootPath = await realpathOr(topLevel.stdout.replace(/\r?\n$/, ""));
+
+  // --- 2a. Disarm executable configuration the repository controls -----------
+  // Placed here, and no later, because every remaining step is a potential
+  // execution vector: `git status` consults `core.fsmonitor`, and `git diff`
+  // consults a `filter.<n>.clean` driver named by an in-tree `.gitattributes`.
+  //
+  // Everything *above* is safe to have run un-audited, which is the load-bearing
+  // claim of this placement: the only commands so far are `rev-parse
+  // --is-inside-work-tree` and `rev-parse --show-toplevel`, and neither reads
+  // the index or the work tree, so neither can trigger a filter or a monitor.
+  // The two fixed-name baseline keys were pinned even for those.
+  //
+  // Reading configuration executes none of it, so the audit is itself safe.
+  neutralise = await resolveNeutralisedConfigKeys(options, diagnostics);
 
   // --- 3. HEAD --------------------------------------------------------------
   const head = await resolveHead(git, diagnostics);
@@ -571,13 +676,24 @@ async function resolveBase(
 // Step 6: scope collection
 // ---------------------------------------------------------------------------
 
-/** Shared flags: detect renames and copies so a move is not an add + delete. */
+/**
+ * Shared flags: detect renames and copies so a move is not an add + delete.
+ *
+ * `--no-ext-diff` and `--no-textconv` are security flags, not formatting ones.
+ * Both `diff.external` and a `diff.<driver>.textconv` selected by an in-tree
+ * `.gitattributes` name a command git runs, and `.gitattributes` is *tracked
+ * content* — it survives `git clone`, unlike `.git/config`. These flags refuse
+ * the behaviour outright rather than relying on the value having been blanked,
+ * so the defence does not depend on the audit having seen the key.
+ */
 const DIFF_FLAGS = [
   "diff",
   "--name-status",
   "-z",
   "--find-renames",
   "--find-copies",
+  "--no-ext-diff",
+  "--no-textconv",
 ] as const;
 
 async function collectChanges(

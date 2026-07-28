@@ -287,6 +287,9 @@ export async function reviewRepository(
     scopes: request.scopes,
     maxFilesPerScope: request.limits.maxFilesPerScope,
     timeoutMs: request.limits.gitTimeoutMs,
+    ...(request.allowRepoExecConfig === true
+      ? { allowRepoExecConfig: true }
+      : {}),
   });
 
   const diagnostics: Diagnostic[] = [...inspection.diagnostics];

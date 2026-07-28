@@ -85,6 +85,10 @@ Options:
   --validation <name>      Named validation from the config, repeatable.
   --config <path>          Operator config file.
   --allow-repo-config      Permit loading <repo>/inspector.config.json.
+  --allow-repo-exec-config Trust repository-scoped git config keys that git
+                           executes, such as filter.*.clean. Off by default;
+                           core.fsmonitor and diff.external stay disabled
+                           either way.
   --max-output-bytes <n>   Per-stream output cap. Default from CLI_LIMITS.
   --timeout <ms>           Per-validation timeout. Default from CLI_LIMITS.
   --exit-zero              Exit 0 whenever a report was produced.

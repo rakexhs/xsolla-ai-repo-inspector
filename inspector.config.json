@@ -1,0 +1,22 @@
+{
+  "validations": {
+    "test": {
+      "argv": ["npm", "test"],
+      "timeoutMs": 300000,
+      "description": "Full vitest suite"
+    },
+    "typecheck": {
+      "argv": ["npm", "run", "typecheck"],
+      "timeoutMs": 120000,
+      "description": "tsc over src and test"
+    },
+    "build": {
+      "argv": ["npm", "run", "build"],
+      "timeoutMs": 120000,
+      "description": "Emit dist and verify declared bin targets"
+    }
+  },
+  "mcp": {
+    "allowValidations": ["typecheck", "build"]
+  }
+}

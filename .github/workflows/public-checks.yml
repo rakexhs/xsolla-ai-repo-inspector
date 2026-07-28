@@ -2,19 +2,65 @@ name: Public checks
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build-and-test:
+    name: Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >= 20.19; the moving "20" selector
+        # resolves to the latest Node 20 patch and therefore tests that boundary.
+        node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The Git inspection tests build their own repositories in a temp
+          # directory, but a full checkout keeps `git` behaviour realistic.
+          fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node-version }}
           cache: npm
+
+      - name: Configure Git identity
+        # Fixture repositories commit during the integration tests, and a
+        # runner has no global identity configured.
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
       - run: npm ci
+
       - run: npm run typecheck
+
       - run: npm run build
+
+      - name: Verify declared bin targets exist
+        # The starter's build exited 0 while `package.json#bin` pointed at a
+        # file the build never produced. This makes that impossible to miss.
+        run: |
+          test -f dist/cli/main.js
+          test -f dist/mcp/server.js
+
       - run: npm test
+
+      - name: Packaging smoke test
+        # Installing the tarball is the only check that catches a broken bin
+        # path, a missing `files` entry, or a lost shebang.
+        run: |
+          set -euo pipefail
+          npm pack --silent
+          tarball="$(ls ./*.tgz | head -n 1)"
+          workdir="$(mktemp -d)"
+          cd "$workdir"
+          npm init -y >/dev/null
+          npm install --silent "$OLDPWD/$tarball"
+          ./node_modules/.bin/inspector --version
+          ./node_modules/.bin/inspector --help >/dev/null

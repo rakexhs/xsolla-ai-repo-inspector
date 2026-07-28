@@ -2,3 +2,5 @@ node_modules/
 dist/
 review-report.md
 *.log
+reports/
+.agent-work/
